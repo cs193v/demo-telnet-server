@@ -5,22 +5,25 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
-import java.net.DatagramSocket;
-import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Listens on port 6789 and prints one line of text per incoming connection.
+ * Prints one line of text per connection that relay.py, running on the host, passes in from the
+ * room. Every connection arrives from loopback, so the relay starts each one with a PROXY
+ * protocol v1 line saying who really made it.
  *
- * Run with: java TelnetServer.java
+ * Run with: java TelnetServer.java (and python3 relay.py on the host)
  */
 public final class TelnetServer {
-    private static final int PORT = 6789;
+    /** Where the relay connects. The host reaches it through the container's port forwarding. */
+    private static final int RELAY_PORT = 6790;
     private static final int BACKLOG = 50;
 
     /** Every address is padded to the width of a maximal dotted quad. */
@@ -36,6 +39,8 @@ public final class TelnetServer {
 
     private static final String BOLD_BRIGHT_BLUE = "\033[1;94m";
     private static final String BRIGHT_WHITE = "\033[97m";
+    private static final String BOLD_BRIGHT_WHITE = "\033[1;97m";
+    private static final String WHITE = "\033[37m";
     private static final String RESET = "\033[0m";
     private static final String CLEAR_LINE = "\r\033[K";
     private static final String HIDE_CURSOR = "\033[?25l";
@@ -50,13 +55,14 @@ public final class TelnetServer {
     private static final Object console = new Object();
     private static final AtomicInteger liveConnections = new AtomicInteger();
 
-    /** Shown in the spinner so people in the room know where to point telnet. */
-    private static final String LISTEN_ADDRESS = primaryAddress();
+    /** Where people in the room should point telnet, as the relay announces it; null until then. */
+    private record Endpoint(String address, int port) {}
+    private static final AtomicReference<Endpoint> publicEndpoint = new AtomicReference<>();
 
     public static void main(String[] args) throws IOException {
-        // Binding to an IPv4 wildcard keeps peer addresses dotted quads, so the column never grows.
+        // IPv4 loopback specifically: the host's forwarding reaches it, and nothing else can.
         ServerSocket server = new ServerSocket();
-        server.bind(new InetSocketAddress(InetAddress.getByName("0.0.0.0"), PORT), BACKLOG);
+        server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), RELAY_PORT), BACKLOG);
 
         if (interactive) {
             Runtime.getRuntime().addShutdownHook(new Thread(TelnetServer::restoreTerminal));
@@ -69,7 +75,6 @@ public final class TelnetServer {
 
         while (true) {
             Socket socket = server.accept();
-            liveConnections.incrementAndGet();
             Thread worker = new Thread(() -> handle(socket), "connection");
             worker.setDaemon(true);
             worker.start();
@@ -78,16 +83,55 @@ public final class TelnetServer {
 
     private static void handle(Socket socket) {
         try (socket) {
-            Line line = readLine(socket.getInputStream());
+            InputStream in = socket.getInputStream();
+            String[] header = readHeader(in).split(" ");
+            if (header.length == 3 && header[0].equals("RELAY")) {
+                holdAnnouncement(in, new Endpoint(header[1], Integer.parseInt(header[2])));
+            } else if (header.length == 6 && header[0].equals("PROXY") && header[1].equals("TCP4")) {
+                converse(in, header[2]);
+            }
+            // Anything else did not come from the relay, so there is no one to credit it to.
+        } catch (IOException | NumberFormatException e) {
+            // The client vanished mid-line, or the relay sent nonsense; nothing worth reporting.
+        }
+    }
+
+    private static void converse(InputStream in, String address) throws IOException {
+        liveConnections.incrementAndGet();
+        try {
+            Line line = readLine(in);
             // A client that hangs up without typing anything has nothing to say.
             if (line.terminated() || !line.text().isEmpty()) {
-                emit(socket.getInetAddress().getHostAddress(), sanitize(line.text()));
+                emit(address, sanitize(line.text()));
             }
-        } catch (IOException e) {
-            // The client vanished mid-line; there is nothing worth reporting.
         } finally {
             liveConnections.decrementAndGet();
         }
+    }
+
+    /** The relay holds this connection open for as long as it is up, and sends nothing more. */
+    private static void holdAnnouncement(InputStream in, Endpoint announced) throws IOException {
+        publicEndpoint.set(announced);
+        try {
+            while (in.read() != -1) {}
+        } finally {
+            // Only forget it if a restarted relay has not already announced again.
+            publicEndpoint.compareAndSet(announced, null);
+        }
+    }
+
+    /** PROXY protocol v1 caps its line at 107 bytes; ours is the same shape or shorter. */
+    private static final int MAX_HEADER = 107;
+
+    /** The relay's first line, without its CRLF. */
+    private static String readHeader(InputStream in) throws IOException {
+        StringBuilder header = new StringBuilder();
+        int b;
+        while ((b = in.read()) != '\n') {
+            if (b == -1 || header.length() == MAX_HEADER) throw new IOException("No header");
+            if (b != '\r') header.append((char) b);
+        }
+        return header.toString();
     }
 
     private record Line(String text, boolean terminated) {}
@@ -179,10 +223,9 @@ public final class TelnetServer {
         int frame = 0;
         while (true) {
             // Budget: one column of slack, plus the spinner glyph and its trailing space.
-            String text = truncate(status(), columns() - 3);
+            String text = render(status(), columns() - 3);
             synchronized (console) {
-                out.print(CLEAR_LINE + BOLD_BRIGHT_BLUE + FRAMES[frame] + RESET
-                        + BRIGHT_WHITE + " " + text + RESET);
+                out.print(CLEAR_LINE + BOLD_BRIGHT_BLUE + FRAMES[frame] + RESET + " " + text);
                 out.flush();
             }
             frame = (frame + 1) % FRAMES.length;
@@ -195,31 +238,37 @@ public final class TelnetServer {
         }
     }
 
-    private static String status() {
+    /** A run of the spinner's text, and the escape code it is drawn in. */
+    private record Span(String style, String text) {}
+
+    private static List<Span> status() {
+        Endpoint endpoint = publicEndpoint.get();
+        if (endpoint == null) return List.of(new Span(BRIGHT_WHITE, "Starting up..."));
+
         int live = liveConnections.get();
-        String where = " to " + LISTEN_ADDRESS + " on port " + PORT;
-        if (live == 0) return "Waiting for a connection" + where + "...";
-        return live + (live == 1 ? " live connection" : " live connections") + where
-                + "; waiting for input...";
+        // The singular's extra space keeps the command in the same column as the plural's.
+        String count = live + (live == 1 ? " connection.  " : " connections. ");
+        // The connective is dimmer, so the count and the command are what stand out.
+        return List.of(new Span(BRIGHT_WHITE, count),
+                new Span(WHITE, "Connect with this command: "),
+                new Span(BOLD_BRIGHT_WHITE, "telnet " + endpoint.address() + " " + endpoint.port()));
     }
 
-    /**
-     * The address on whichever interface the default route uses, which is the one a client
-     * elsewhere on the network should telnet to. The listener itself is bound to the wildcard,
-     * so this is advisory: connections to any local address are still accepted.
-     */
-    private static String primaryAddress() {
-        try (DatagramSocket probe = new DatagramSocket()) {
-            // Connecting a UDP socket sends no packets; it only selects the outbound interface.
-            probe.connect(InetAddress.getByName("8.8.8.8"), 53);
-            InetAddress local = probe.getLocalAddress();
-            if (local instanceof Inet4Address && !local.isAnyLocalAddress()) {
-                return local.getHostAddress();
-            }
-        } catch (Exception e) {
-            // No route off this machine; loopback is the only address that can be reached.
+    /** The spans in their styles, truncated to fit in room columns. */
+    private static String render(List<Span> spans, int room) {
+        StringBuilder plain = new StringBuilder();
+        for (Span span : spans) plain.append(span.text());
+        // Styled by position after truncating, so escape codes never count against the width.
+        String shown = truncate(plain.toString(), room);
+
+        StringBuilder styled = new StringBuilder();
+        int start = 0;
+        for (Span span : spans) {
+            int end = Math.min(shown.length(), start + span.text().length());
+            if (start < end) styled.append(span.style()).append(shown, start, end).append(RESET);
+            start = end;
         }
-        return "127.0.0.1";
+        return styled.toString();
     }
 
     private static volatile int cachedColumns = FALLBACK_COLUMNS;
