@@ -7,10 +7,11 @@ The container sees every relayed connection arrive from its loopback, so each on
 PROXY protocol v1 line naming the address it really came from. One extra connection, held open
 for as long as both sides are up, tells the server which address the room should telnet to.
 
-Traffic only flows one way. Nothing the room sends is interpreted here, and nothing is ever sent
-back: TelnetServer never writes, so anything that arrives from the container ends the connection
-instead of reaching the room. Whatever happens to be listening on the backend port, the room
-cannot read from it.
+Traffic only flows one way. Nothing the room sends is interpreted here, and nothing from the
+container is ever sent back: TelnetServer never writes, so anything that arrives from the
+container ends the connection instead of reaching the room. Whatever happens to be listening on
+the backend port, the room cannot read from it. The one thing the room does receive is GREETING,
+which is fixed in this file.
 
 Run with: python3 relay.py
 """
@@ -26,6 +27,15 @@ PUBLIC_PORT = 6789
 BACKEND = ("127.0.0.1", 6790)
 BACKLOG = 128
 RETRY_SECONDS = 1
+
+# Shown in telnet the moment a connection reaches the server, before anyone has typed. Plain ASCII
+# lines, each ending in CRLF as telnet expects.
+GREETING = (
+    # A blank line first, to set it apart from telnet's own "Escape character is" line.
+    "\r\n"
+    "You're connected! Type a one-line message and press Enter.\r\n"
+    "It will appear on the screen at the front of the room.\r\n"
+)
 
 # How often to look for a new address, so the relay can be started before reaching the lecture hall.
 ADDRESS_CHECK_SECONDS = 2
@@ -120,6 +130,7 @@ def relay(client, source):
             dest_ip, dest_port = client.getsockname()
             header = f"PROXY TCP4 {source[0]} {dest_ip} {source[1]} {dest_port}\r\n"
             backend.sendall(header.encode("ascii"))
+            client.sendall(GREETING.encode("ascii"))
 
             poller = select.poll()
             poller.register(client, select.POLLIN)
