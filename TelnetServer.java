@@ -1,30 +1,58 @@
 import java.io.BufferedReader;
+import java.io.Closeable;
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.net.DatagramSocket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Prints one line of text per connection that relay.py, running on the host, passes in from the
- * room. Every connection arrives from loopback, so the relay starts each one with a PROXY
- * protocol v1 line saying who really made it.
+ * Listens on port 6789 at this machine's primary address and prints one line of text per
+ * incoming connection.
  *
- * Run with: java TelnetServer.java (and python3 relay.py on the host)
+ * Run with: java TelnetServer.java
  */
 public final class TelnetServer {
-    /** Where the relay connects. The host reaches it through the container's port forwarding. */
-    private static final int RELAY_PORT = 6790;
-    private static final int BACKLOG = 50;
+    private static final int PORT = 6789;
+    private static final int BACKLOG = 128;
+
+    /** Shown in telnet the moment a connection arrives, before anyone has typed. */
+    private static final String GREETING =
+            // A blank line first, to set it apart from telnet's own "Escape character is" line.
+            "\r\n"
+            + "You're connected! Type a one-line message and press Enter.\r\n"
+            + "It will appear on the screen at the front of the room.\r\n";
+
+    /**
+     * How often to look for a new address, so the server can be started before reaching the
+     * lecture hall.
+     */
+    private static final long ADDRESS_CHECK_MS = 2_000;
+
+    /**
+     * Two each for a class of 300, and few enough per address that no one person can take them
+     * all.
+     */
+    private static final int MAX_CONNECTIONS = 600;
+    private static final int MAX_PER_ADDRESS = 4;
+    /**
+     * Long enough to sit through an explanation before typing; short enough to reclaim abandoned
+     * slots.
+     */
+    private static final int IDLE_MS = 10 * 60 * 1000;
 
     /** Every address is padded to the width of a maximal dotted quad. */
     private static final int IP_WIDTH = "NNN.NNN.NNN.NNN".length();
@@ -54,16 +82,15 @@ public final class TelnetServer {
     /** Guards the cursor: the spinner and the message printer share one line of screen. */
     private static final Object console = new Object();
     private static final AtomicInteger liveConnections = new AtomicInteger();
+    /** Open connections from each address. Guards itself, and liveConnections too. */
+    private static final Map<String, Integer> connectionsFrom = new HashMap<>();
 
-    /** Where people in the room should point telnet, as the relay announces it; null until then. */
-    private record Endpoint(String address, int port) {}
-    private static final AtomicReference<Endpoint> publicEndpoint = new AtomicReference<>();
+    /** Where the listener is bound, and so where the room is told to telnet; null while unbound. */
+    private static volatile String listeningOn;
+    /** Why the last attempt to listen failed; null once one succeeds. */
+    private static volatile String listenFailure;
 
-    public static void main(String[] args) throws IOException {
-        // IPv4 loopback specifically: the host's forwarding reaches it, and nothing else can.
-        ServerSocket server = new ServerSocket();
-        server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), RELAY_PORT), BACKLOG);
-
+    public static void main(String[] args) throws InterruptedException {
         if (interactive) {
             Runtime.getRuntime().addShutdownHook(new Thread(TelnetServer::restoreTerminal));
             out.print(HIDE_CURSOR);
@@ -73,65 +100,114 @@ public final class TelnetServer {
             spinner.start();
         }
 
+        ServerSocket listener = null;
         while (true) {
-            Socket socket = server.accept();
-            Thread worker = new Thread(() -> handle(socket), "connection");
-            worker.setDaemon(true);
-            worker.start();
-        }
-    }
-
-    private static void handle(Socket socket) {
-        try (socket) {
-            InputStream in = socket.getInputStream();
-            String[] header = readHeader(in).split(" ");
-            if (header.length == 3 && header[0].equals("RELAY")) {
-                holdAnnouncement(in, new Endpoint(header[1], Integer.parseInt(header[2])));
-            } else if (header.length == 6 && header[0].equals("PROXY") && header[1].equals("TCP4")) {
-                converse(in, header[2]);
+            String address = primaryAddress();
+            if (address != null && !address.equals(listeningOn)) {
+                if (listener != null) {
+                    listeningOn = null;
+                    // Its acceptor sees it closed and stops; connections already open carry on.
+                    close(listener);
+                }
+                listener = listen(address);
             }
-            // Anything else did not come from the relay, so there is no one to credit it to.
-        } catch (IOException | NumberFormatException e) {
-            // The client vanished mid-line, or the relay sent nonsense; nothing worth reporting.
+            Thread.sleep(ADDRESS_CHECK_MS);
         }
     }
 
-    private static void converse(InputStream in, String address) throws IOException {
-        liveConnections.incrementAndGet();
+    /**
+     * A listener on just the address the room is told to use, not every interface (VPNs too).
+     * Binding to an IPv4 address keeps peer addresses dotted quads, so the column never grows.
+     */
+    private static ServerSocket listen(String address) {
+        ServerSocket listener;
         try {
-            Line line = readLine(in);
-            // A client that hangs up without typing anything has nothing to say.
-            if (line.terminated() || !line.text().isEmpty()) {
-                emit(address, sanitize(line.text()));
+            listener = new ServerSocket(PORT, BACKLOG, InetAddress.getByName(address));
+        } catch (IOException e) {
+            listenFailure = "Cannot listen on " + address + " port " + PORT + ": " + e.getMessage()
+                    + ". Retrying...";
+            report(listenFailure);
+            return null;
+        }
+
+        Thread acceptor = new Thread(() -> accept(listener), "acceptor");
+        acceptor.setDaemon(true);
+        acceptor.start();
+        listeningOn = address;
+        listenFailure = null;
+        report("The room should telnet to " + address + " " + PORT + ".");
+        return listener;
+    }
+
+    /** Hands each connection to a thread of its own, until the listener is closed. */
+    private static void accept(ServerSocket listener) {
+        while (true) {
+            Socket socket;
+            try {
+                socket = listener.accept();
+            } catch (IOException e) {
+                if (listener.isClosed()) return;
+                // Out of descriptors, or a client that gave up while queued. Neither is fatal.
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                continue;
             }
-        } finally {
+
+            String address = socket.getInetAddress().getHostAddress();
+            if (!admit(address)) {
+                close(socket);
+                continue;
+            }
+            try {
+                Thread worker = new Thread(() -> handle(socket, address), "connection");
+                worker.setDaemon(true);
+                worker.start();
+            } catch (OutOfMemoryError e) {
+                // Out of threads. Turn this one away and keep serving everyone else.
+                release(address);
+                close(socket);
+            }
+        }
+    }
+
+    private static boolean admit(String address) {
+        synchronized (connectionsFrom) {
+            if (liveConnections.get() >= MAX_CONNECTIONS
+                    || connectionsFrom.getOrDefault(address, 0) >= MAX_PER_ADDRESS) {
+                return false;
+            }
+            connectionsFrom.merge(address, 1, Integer::sum);
+            liveConnections.incrementAndGet();
+            return true;
+        }
+    }
+
+    private static void release(String address) {
+        synchronized (connectionsFrom) {
+            // Dropping the entry at zero keeps the map to the addresses connected right now.
+            connectionsFrom.computeIfPresent(address, (a, open) -> open == 1 ? null : open - 1);
             liveConnections.decrementAndGet();
         }
     }
 
-    /** The relay holds this connection open for as long as it is up, and sends nothing more. */
-    private static void holdAnnouncement(InputStream in, Endpoint announced) throws IOException {
-        publicEndpoint.set(announced);
-        try {
-            while (in.read() != -1) {}
+    private static void handle(Socket socket, String address) {
+        try (socket) {
+            socket.setSoTimeout(IDLE_MS);
+            socket.getOutputStream().write(GREETING.getBytes(StandardCharsets.US_ASCII));
+            Line line = readLine(socket.getInputStream());
+            // A client that hangs up without typing anything has nothing to say.
+            if (line.terminated() || !line.text().isEmpty()) {
+                emit(address, sanitize(line.text()));
+            }
+        } catch (IOException e) {
+            // The client vanished mid-line; there is nothing worth reporting.
         } finally {
-            // Only forget it if a restarted relay has not already announced again.
-            publicEndpoint.compareAndSet(announced, null);
+            release(address);
         }
-    }
-
-    /** PROXY protocol v1 caps its line at 107 bytes; ours is the same shape or shorter. */
-    private static final int MAX_HEADER = 107;
-
-    /** The relay's first line, without its CRLF. */
-    private static String readHeader(InputStream in) throws IOException {
-        StringBuilder header = new StringBuilder();
-        int b;
-        while ((b = in.read()) != '\n') {
-            if (b == -1 || header.length() == MAX_HEADER) throw new IOException("No header");
-            if (b != '\r') header.append((char) b);
-        }
-        return header.toString();
     }
 
     private record Line(String text, boolean terminated) {}
@@ -148,7 +224,7 @@ public final class TelnetServer {
         int state = DATA;
         int b;
 
-        while ((b = in.read()) != -1) {
+        while ((b = nextByte(in)) != -1) {
             switch (state) {
                 case AFTER_IAC -> {
                     if (b >= WILL && b <= DONT) {
@@ -178,6 +254,18 @@ public final class TelnetServer {
             }
         }
         return new Line(pending.toString(), false);
+    }
+
+    /**
+     * The next byte, or -1 once the client hangs up or goes quiet. Treating the two alike means a
+     * line typed without Enter still counts either way.
+     */
+    private static int nextByte(InputStream in) throws IOException {
+        try {
+            return in.read();
+        } catch (SocketTimeoutException e) {
+            return -1;
+        }
     }
 
     /** Keeps the printable ASCII range: letters, digits, punctuation and the space. */
@@ -242,8 +330,11 @@ public final class TelnetServer {
     private record Span(String style, String text) {}
 
     private static List<Span> status() {
-        Endpoint endpoint = publicEndpoint.get();
-        if (endpoint == null) return List.of(new Span(BRIGHT_WHITE, "Starting up..."));
+        String address = listeningOn;
+        if (address == null) {
+            String failure = listenFailure;
+            return List.of(new Span(BRIGHT_WHITE, failure != null ? failure : "Starting up..."));
+        }
 
         int live = liveConnections.get();
         // The singular's extra space keeps the command in the same column as the plural's.
@@ -251,7 +342,7 @@ public final class TelnetServer {
         // The connective is dimmer, so the count and the command are what stand out.
         return List.of(new Span(BRIGHT_WHITE, count),
                 new Span(WHITE, "Connect with this command: "),
-                new Span(BOLD_BRIGHT_WHITE, "telnet " + endpoint.address() + " " + endpoint.port()));
+                new Span(BOLD_BRIGHT_WHITE, "telnet " + address + " " + PORT));
     }
 
     /** The spans in their styles, truncated to fit in room columns. */
@@ -269,6 +360,48 @@ public final class TelnetServer {
             start = end;
         }
         return styled.toString();
+    }
+
+    /** Only the main thread reports, so this needs no guarding. */
+    private static String lastReport;
+
+    /** With no spinner to show it on, news of the listener goes to stderr, once per change. */
+    private static void report(String message) {
+        if (!interactive && !message.equals(lastReport)) System.err.println(message);
+        lastReport = message;
+    }
+
+    /**
+     * The address on whichever interface the default route uses, which is the one a client
+     * elsewhere on the network should telnet to, or null if there was not even a descriptor to
+     * spare for finding out.
+     */
+    private static String primaryAddress() {
+        DatagramSocket probe;
+        try {
+            probe = new DatagramSocket();
+        } catch (SocketException e) {
+            return null;
+        }
+        try (probe) {
+            // Connecting a UDP socket sends no packets; it only selects the outbound interface.
+            probe.connect(InetAddress.getByName("8.8.8.8"), 53);
+            InetAddress local = probe.getLocalAddress();
+            if (local instanceof Inet4Address && !local.isAnyLocalAddress()) {
+                return local.getHostAddress();
+            }
+        } catch (Exception e) {
+            // No route off this machine; loopback is the only address that can be reached.
+        }
+        return "127.0.0.1";
+    }
+
+    private static void close(Closeable closeable) {
+        try {
+            closeable.close();
+        } catch (IOException e) {
+            // Closed as far as anyone can tell; there is nothing more to do.
+        }
     }
 
     private static volatile int cachedColumns = FALLBACK_COLUMNS;
