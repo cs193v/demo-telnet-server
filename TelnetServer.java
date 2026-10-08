@@ -29,12 +29,16 @@ public final class TelnetServer {
     private static final int PORT = 6789;
     private static final int BACKLOG = 128;
 
-    /** Shown in telnet the moment a connection arrives, before anyone has typed. */
+    /**
+     * Shown in telnet the moment a connection arrives, before anyone has typed. The %s is the
+     * client's own address, exactly as it will label their message on the screen.
+     */
     private static final String GREETING =
             // A blank line first, to set it apart from telnet's own "Escape character is" line.
             "\r\n"
             + "You're connected! Type a one-line message and press Enter.\r\n"
-            + "It will appear on the screen at the front of the room.\r\n";
+            + "It will appear on the screen at the front of the room.\r\n"
+            + "Look for your IP address, %s, at the start of the line.\r\n";
 
     /**
      * How often to look for a new address, so the server can be started before reaching the
@@ -197,7 +201,8 @@ public final class TelnetServer {
     private static void handle(Socket socket, String address) {
         try (socket) {
             socket.setSoTimeout(IDLE_MS);
-            socket.getOutputStream().write(GREETING.getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().write(
+                    GREETING.formatted(address).getBytes(StandardCharsets.US_ASCII));
             Line line = readLine(socket.getInputStream());
             // A client that hangs up without typing anything has nothing to say.
             if (line.terminated() || !line.text().isEmpty()) {
