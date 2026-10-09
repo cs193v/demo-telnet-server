@@ -1,1 +1,3 @@
+# Meant to be used as a .bashrc file
+[ -f ~/.bashrc ] && source ~/.bashrc
 PS1="${debian_chroot:+($debian_chroot)}\[\033[01;32m\]student@cs193v-development\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
