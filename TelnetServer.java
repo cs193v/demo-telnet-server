@@ -36,9 +36,9 @@ public final class TelnetServer {
     private static final String GREETING =
             // A blank line first, to set it apart from telnet's own "Escape character is" line.
             "\r\n"
-            + "You're connected! Type a one-line message and press Enter.\r\n"
-            + "It will appear on the screen at the front of the room.\r\n"
-            + "Look for your IP address, %s, at the start of the line.\r\n";
+            + "Hello! Your IP address is %s.\r\n"
+            + "Type a message and press ENTER.\r\n\r\n"
+            + "> ";
 
     /**
      * How often to look for a new address, so the server can be started before reaching the
