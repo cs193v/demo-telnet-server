@@ -65,7 +65,7 @@ public final class TelnetServer {
      */
     private static final int IDLE_MS = 10 * 60 * 1000;
 
-    /** Every address is padded to the width of a maximal dotted quad. */
+    /** Every address is right-aligned in the width of a maximal dotted quad. */
     private static final int IP_WIDTH = "NNN.NNN.NNN.NNN".length();
     private static final String SEPARATOR = " says: ";
 
@@ -311,7 +311,7 @@ public final class TelnetServer {
 
     private static String pad(String address) {
         if (address.length() >= IP_WIDTH) return address;
-        return address + " ".repeat(IP_WIDTH - address.length());
+        return " ".repeat(IP_WIDTH - address.length()) + address;
     }
 
     private static String truncate(String message, int room) {
