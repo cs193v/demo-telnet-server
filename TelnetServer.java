@@ -80,8 +80,8 @@ public final class TelnetServer {
 
     private static final PrintStream out =
             new PrintStream(new FileOutputStream(FileDescriptor.out), false, StandardCharsets.UTF_8);
-    private static final boolean interactive =
-            System.console() != null && System.console().isTerminal();
+    /** On Java 21 and earlier, and again from 25, there is a console only on a terminal. */
+    private static final boolean interactive = System.console() != null;
 
     /** Guards the cursor: the spinner and the message printer share one line of screen. */
     private static final Object console = new Object();
