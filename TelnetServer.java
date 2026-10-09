@@ -41,6 +41,13 @@ public final class TelnetServer {
             + "> ";
 
     /**
+     * Sent once the message is in, so the client's own "Connection closed by foreign host" that
+     * follows reads as the expected end rather than an error.
+     */
+    private static final String FAREWELL =
+            "\r\nMessage received! Closing the connection.\r\n";
+
+    /**
      * How often to look for a new address, so the server can be started before reaching the
      * lecture hall.
      */
@@ -207,9 +214,10 @@ public final class TelnetServer {
             // A client that hangs up without typing anything has nothing to say.
             if (line.terminated() || !line.text().isEmpty()) {
                 emit(address, sanitize(line.text()));
+                socket.getOutputStream().write(FAREWELL.getBytes(StandardCharsets.US_ASCII));
             }
         } catch (IOException e) {
-            // The client vanished mid-line; there is nothing worth reporting.
+            // The client vanished mid-line or before the farewell; nothing is worth reporting.
         } finally {
             release(address);
         }
